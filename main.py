@@ -16,16 +16,23 @@ class FFNLayer(layers.Layer):
 
 
 class CausalMaskAttention(layers.Layer):
-    def __init__(self, d_model=128, num_heads=4, if_mask=True, **kwargs):
+    def __init__(self, d_model=128, num_heads=4, ns_len=4, if_mask=True, **kwargs):
         super().__init__(**kwargs)
         self.d_model = d_model
         self.num_heads = num_heads
         self.depth = self.d_model // num_heads
-        self.wq = layers.Dense(self.d_model)
-        self.wk = layers.Dense(self.d_model)
-        self.wv = layers.Dense(self.d_model)
+        self.kqv_list = []
         self.dense = layers.Dense(self.d_model)
+        self.ns_len = ns_len
         self.if_mask = if_mask
+        for i in range(ns_len + 1):
+            self.kqv_list.append(
+                (
+                    layers.Dense(self.d_model),
+                    layers.Dense(self.d_model),
+                    layers.Dense(self.d_model),
+                )
+            )
 
     def split_heads(self, x, batch_size):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
@@ -37,14 +44,33 @@ class CausalMaskAttention(layers.Layer):
         causal_mask = (1.0 - mask) * -1e9
         return causal_mask
 
+    def _cal_kqv_(self, x, a, b, batch_size):
+        if len(x.shape) == 2:
+            x = tf.reshape(x, (batch_size, 1, -1))
+        return self.kqv_list[a][b](x)
+
+    def cal_mix_param_kqv(self, x, batch_size):
+        ks = []
+        qs = []
+        vs = []
+
+        if self.ns_len < x[0].shape[1]:
+            ks.append(self._cal_kqv_(x[0][:, :-self.ns_len, :], 0, 0, batch_size))
+            qs.append(self._cal_kqv_(x[1][:, :-self.ns_len, :], 0, 1, batch_size))
+            vs.append(self._cal_kqv_(x[2][:, :-self.ns_len, :], 0, 2, batch_size))
+        for i in range(self.ns_len):
+            j = i + 1
+            ks.append(self._cal_kqv_(x[0][:, -j, :], j, 0, batch_size))
+            qs.append(self._cal_kqv_(x[1][:, -j, :], j, 1, batch_size))
+            vs.append(self._cal_kqv_(x[2][:, -j, :], j, 2, batch_size))
+        return tf.concat(ks, axis=1), tf.concat(qs, axis=1), tf.concat(vs, axis=1)
+
     def call(self, x):
         batch_size = tf.shape(x[0])[0]
         seq_len_k = tf.shape(x[0])[1]
         seq_len_q = tf.shape(x[1])[1]
 
-        k = self.wk(x[0])
-        q = self.wq(x[1])
-        v = self.wv(x[2])
+        k, q, v = self.cal_mix_param_kqv(x, batch_size)
         k = self.split_heads(k, batch_size)
         q = self.split_heads(q, batch_size)
         v = self.split_heads(v, batch_size)
@@ -77,7 +103,7 @@ class CausalMaskAttention(layers.Layer):
 
 
 class OneTransBlock(layers.Layer):
-    def __init__(self, d_model=128, num_heads=4, ffn_units=(256, 128), pyramid_stack_size=None, **kwargs):
+    def __init__(self, d_model=128, num_heads=4, ffn_units=(256, 128), ns_len=4, pyramid_stack_size=None, **kwargs):
         super().__init__()
         self.ffn = None
         self.cma = None
@@ -86,12 +112,13 @@ class OneTransBlock(layers.Layer):
         self.d_model = d_model
         self.num_heads = num_heads
         self.ffn_units = ffn_units
+        self.ns_len = ns_len
         self.pyramid_stack_size = pyramid_stack_size
 
     def build(self, input_shape):
         self.rms_0 = tf.keras.layers.LayerNormalization()
         self.rms_1 = tf.keras.layers.LayerNormalization()
-        self.cma = CausalMaskAttention(d_model=self.d_model, num_heads=self.num_heads)
+        self.cma = CausalMaskAttention(d_model=self.d_model, num_heads=self.num_heads, ns_len=self.ns_len)
         self.ffn = FFNLayer(unit_1=self.ffn_units[0], unit_2=self.ffn_units[1])
 
     def call(self, x):
@@ -210,9 +237,9 @@ MULTI_NUM = 8
 FFN_UNITS = (64, D_MODEL)
 # 最底层block，内有两个多层OneTransBlock，分别过序列特征和非序列特征，最后拼接得到一个大的序列
 # [batch_size, seq_len, D_MODEL] + [batch_size, N, D_MODEL] = [batch_size, seq_len + N, D_MODEL]
-base_block = BaseOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
+base_block = StackOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
 # 这里注意 - 序列特征在前 非序列特征在后，不然后续的压缩对象就错了（包括序列特征里的拼接顺序，也要按时间先后）
-base_embedding = base_block([s_feat, ns_feat])
+base_embedding = base_block(tf.concat([s_feat, ns_feat], axis=1))
 print("序列编码特征+非序列编码特征 → 过底层 OneBlock 结构后[batch_size, SEQ_LEN + N, D_MODEL]: ", base_embedding.shape)
 # 然后是不断蒸馏、压缩这段序列向量，理论上是有 seq_len 个序列，就压缩 seq_len 次
 # 形象的解释就是，把之前第 N 次行为，压缩到 N-1 次，再压缩到 N-2 次 .... 直到只剩下非序列特征
