@@ -6,10 +6,10 @@ from tensorflow.keras import layers
 class FFNLayer(layers.Layer):
     def __init__(self, unit_1=256, unit_2=128, **kwargs):
         super(FFNLayer, self).__init__()
-        self.dense_1 = layers.Dense(unit_1, activation='relu')
-        self.dense_2 = layers.Dense(unit_2, activation='relu')
+        self.dense_1 = layers.Dense(unit_1, activation='swish')
+        self.dense_2 = layers.Dense(unit_2, activation='swish')
 
-    def call(self, x, training=False):
+    def call(self, x):
         x = self.dense_1(x)
         x = self.dense_2(x)
         return x
@@ -105,7 +105,7 @@ class CausalMaskAttention(layers.Layer):
 class OneTransBlock(layers.Layer):
     def __init__(self, d_model=128, num_heads=4, ffn_units=(256, 128), ns_len=4, pyramid_stack_size=None, **kwargs):
         super().__init__()
-        self.ffn = None
+        self.ffn_list = []
         self.cma = None
         self.rms_1 = None
         self.rms_0 = None
@@ -119,18 +119,38 @@ class OneTransBlock(layers.Layer):
         self.rms_0 = tf.keras.layers.LayerNormalization()
         self.rms_1 = tf.keras.layers.LayerNormalization()
         self.cma = CausalMaskAttention(d_model=self.d_model, num_heads=self.num_heads, ns_len=self.ns_len)
-        self.ffn = FFNLayer(unit_1=self.ffn_units[0], unit_2=self.ffn_units[1])
+        # ffn 的个数除了最顶层只有 ns_len 外，其他都是 ns_len + 1
+        # 这里都设置为 ns_len+1 个，最顶层会有个 ffn 被浪费了，可以优化
+        for i in range(self.ns_len+1):
+            self.ffn_list.append(FFNLayer(unit_1=self.ffn_units[0], unit_2=self.ffn_units[1]))
+
+    def _cal_ffn_(self, x, idx, batch_size):
+        if len(x.shape) == 2:
+            x = tf.reshape(x, (batch_size, 1, -1))
+        return self.ffn_list[idx](x)
+
+    def cal_mix_param_ffn(self, x, batch_size):
+        res = []
+        if self.ns_len < x[0].shape[1]:
+            res.append(self._cal_ffn_(x[:, :-self.ns_len, :], 0, batch_size))
+
+        for i in range(self.ns_len):
+            j = i + 1
+            res.append(self._cal_ffn_(x[:, -j, :], j, batch_size))
+
+        return tf.concat(res, axis=1)
 
     def call(self, x):
         """
         :param x: [batch_size, seq_len, d_model]
         :return:
         """
-        x = self.rms_0(x)
+        batch_size = tf.shape(x)[0]
 
+        x = self.rms_0(x)
         k_x, q_x, v_x = x, x, x
         if self.pyramid_stack_size is not None:
-            q_x = tf.slice(x, [0, 0, 0], self.pyramid_stack_size)
+            q_x = tf.slice(x, [0, 0, 0], [-1, self.pyramid_stack_size, -1])
         origin_x = q_x
 
         x = self.cma([k_x, q_x, v_x])
@@ -138,53 +158,13 @@ class OneTransBlock(layers.Layer):
         origin_x = x
 
         x = self.rms_1(x)
-        x = self.ffn(x)
+        x = self.cal_mix_param_ffn(x, batch_size)
         x = origin_x + x
 
         return x
 
 
-class BaseOneTransBlock(layers.Layer):
-    def __init__(self, d_model=128, num_heads=4, ffn_units=(256, 128), n=4):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.ffn_units = ffn_units
-        self.n = n
-        self.ns_otb_list = []
-        self.s_otb_list = []
-
-    def build(self, input_shape):
-        for i in range(self.n):
-            self.ns_otb_list.append(OneTransBlock(d_model=self.d_model, num_heads=self.num_heads, ffn_units=self.ffn_units))
-            self.s_otb_list.append(OneTransBlock(d_model=self.d_model, num_heads=self.num_heads, ffn_units=self.ffn_units))
-
-    def call(self, x):
-        """
-        :param x: 这里设计的有点丑陋，x[0]是序列特征编码结果，x[1]是非序列特征编码结果
-        :return:
-        """
-        s_emb = x[0]
-        ns_emb = x[1]
-        ns_res = []
-        s_res = []
-
-        for otb in self.ns_otb_list:
-            ns_res.append(otb(ns_emb))
-        for otb in self.s_otb_list:
-            s_res.append(otb(s_emb))
-
-        # [n, batch_size, seq_len, dim]
-        ns_res = tf.convert_to_tensor(ns_res)
-        # [batch_size, seq_len, dim]
-        ns_res = tf.reduce_mean(ns_res, axis=0)
-        s_res = tf.convert_to_tensor(s_res)
-        s_res = tf.reduce_mean(s_res, axis=0)
-
-        return tf.concat([ns_res, s_res], axis=1)
-
-
-class StackOneTransBlock(layers.Layer):
+class MultiOneTransBlock(layers.Layer):
     def __init__(self, d_model=128, num_heads=4, ffn_units=(256, 128), n=4, pyramid_stack_size=None):
         super().__init__()
         self.d_model = d_model
@@ -237,7 +217,7 @@ MULTI_NUM = 8
 FFN_UNITS = (64, D_MODEL)
 # 最底层block，内有两个多层OneTransBlock，分别过序列特征和非序列特征，最后拼接得到一个大的序列
 # [batch_size, seq_len, D_MODEL] + [batch_size, N, D_MODEL] = [batch_size, seq_len + N, D_MODEL]
-base_block = StackOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
+base_block = MultiOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
 # 这里注意 - 序列特征在前 非序列特征在后，不然后续的压缩对象就错了（包括序列特征里的拼接顺序，也要按时间先后）
 base_embedding = base_block(tf.concat([s_feat, ns_feat], axis=1))
 print("序列编码特征+非序列编码特征 → 过底层 OneBlock 结构后[batch_size, SEQ_LEN + N, D_MODEL]: ", base_embedding.shape)
@@ -247,15 +227,15 @@ print("序列编码特征+非序列编码特征 → 过底层 OneBlock 结构后
 base_seq_len = base_embedding.shape[1]
 
 # 第一层压缩，把序列长度从 base_seq_len 压缩到 base_seq_len - 1
-stack_block_1 = StackOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=[-1, base_seq_len - 1, -1])
+stack_block_1 = MultiOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=base_seq_len - 1)
 stack_embedding = stack_block_1(base_embedding)
 print("过第一层压缩结构后[batch_size, SEQ_LEN + N - 1, D_MODEL]: ", stack_embedding.shape)
 # 第二层压缩，把序列长度从 base_seq_len 压缩到 base_seq_len - 2
-stack_block_2 = StackOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=[-1, base_seq_len - 2, -1])
+stack_block_2 = MultiOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=base_seq_len - 2)
 stack_embedding = stack_block_2(stack_embedding)
 print("过第二层压缩结构后[batch_size, SEQ_LEN + N - 2, D_MODEL]: ", stack_embedding.shape)
 # 第三层压缩，把序列长度从 base_seq_len 压缩到 base_seq_len - 3
-stack_block_3 = StackOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=[-1, base_seq_len - 3, -1])
+stack_block_3 = MultiOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM, pyramid_stack_size=base_seq_len - 3)
 stack_embedding = stack_block_3(stack_embedding)
 print("过第三层压缩结构后[batch_size, SEQ_LEN + N - 3, D_MODEL]: ", stack_embedding.shape)
 print()
