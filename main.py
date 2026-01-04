@@ -38,10 +38,10 @@ class CausalMaskAttention(layers.Layer):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(x, perm=[0, 2, 1, 3])
 
-    @staticmethod
-    def create_causal_mask(x, y):
-        mask = tf.linalg.band_part(tf.ones((x, y)), num_lower=-1, num_upper=0)
-        causal_mask = (1.0 - mask) * -1e9
+    def create_causal_mask(self, x, y):
+        # 前 ns_len 的长度不需要mask
+        mask = tf.linalg.band_part(tf.ones((x, y)), num_lower=-1, num_upper=self.ns_len-1)
+        causal_mask = mask + 1e-9
         return causal_mask
 
     def _cal_kqv_(self, x, a, b):
@@ -73,11 +73,10 @@ class CausalMaskAttention(layers.Layer):
         q = self.split_heads(q, batch_size)
         v = self.split_heads(v, batch_size)
 
-        # (batch_size, num_heads, seq_len, seq_len)
+        # (batch_size, num_heads, seq_len_q, seq_len_k)
         matmul_qk = tf.matmul(q, k, transpose_b=True)
-        dk = tf.cast(self.depth, tf.float32)
-        # (batch_size, num_heads, seq_len, seq_len)
-        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+        # (batch_size, num_heads, seq_len_q, seq_len_k)
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(tf.cast(self.depth, tf.float32))
 
         # mask
         if self.if_mask:
@@ -206,7 +205,7 @@ MULTI_NUM = 8
 FFN_UNITS = (64, D_MODEL)
 # 最底层block，内有两个多层OneTransBlock，分别过序列特征和非序列特征，最后拼接得到一个大的序列
 # [batch_size, seq_len, D_MODEL] + [batch_size, N, D_MODEL] = [batch_size, seq_len + N, D_MODEL]
-base_block = MultiOneTransBlock(d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
+base_block = MultiOneTransBlock(ns_len=ns_len, d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
 # 这里注意 - 非序列特征在前 序列特征在后，不然后续的压缩对象就错了（包括序列特征里的拼接顺序，时间近的靠左）
 base_embedding = base_block(tf.concat([ns_feat, s_feat], axis=1))
 print("序列编码特征+非序列编码特征 → 过底层 OneBlock 结构后[batch_size, SEQ_LEN + N, D_MODEL]: ", base_embedding.shape)
