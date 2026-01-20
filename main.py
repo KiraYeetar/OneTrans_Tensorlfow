@@ -39,7 +39,7 @@ class CausalMaskAttention(layers.Layer):
         return tf.transpose(x, perm=[0, 2, 1, 3])
 
     def create_causal_mask(self, x, y):
-        # 前 ns_len 的长度不需要mask
+        # 前 ns_len 的长度不需要mask，这个细节我也不确定是否正确
         mask = tf.linalg.band_part(tf.ones((x, y)), num_lower=-1, num_upper=self.ns_len-1)
         causal_mask = mask + 1e-9
         return causal_mask
@@ -190,23 +190,23 @@ print("编码后[batch_size, seq_len, D_MODEL]: ", s_feat.shape)
 
 # 假设有非序列特征拼接后 [batch_size, 随机维度]
 n_seq_feature = tf.random.normal((BATCH_SIZE, 128), dtype=tf.float32)
-# tokenizer 编码后得到 [batch_size, N, D_MODEL]
+# tokenizer 编码后得到 [batch_size, ns_len, D_MODEL]
 # 非序列特征的 tokenizer 就是把原始特征改造为序列结构，长度 ns_len 自己定
 ns_len = 2
 ns_feat = layers.Dense(ns_len * D_MODEL)(n_seq_feature)
 ns_feat = tf.reshape(ns_feat, [BATCH_SIZE, ns_len, D_MODEL])
 print("设有非序列特征[batch_size, 随机维度]: ", n_seq_feature.shape)
-print("编码后[batch_size, N, D_MODEL]: ", ns_feat.shape)
+print("编码后[batch_size, ns_len, D_MODEL]: ", ns_feat.shape)
 print()
 
 # 定义block结构
 NUM_HEAD = 4
 MULTI_NUM = 8
 FFN_UNITS = (64, D_MODEL)
-# 最底层block，内有两个多层OneTransBlock，分别过序列特征和非序列特征，最后拼接得到一个大的序列
-# [batch_size, seq_len, D_MODEL] + [batch_size, N, D_MODEL] = [batch_size, seq_len + N, D_MODEL]
+# 最底层block，拼接序列特征和非序列特征后输入
+# [batch_size, seq_len, D_MODEL] + [batch_size, ns_len, D_MODEL] = [batch_size, seq_len + N, D_MODEL]
 base_block = MultiOneTransBlock(ns_len=ns_len, d_model=D_MODEL, num_heads=NUM_HEAD, ffn_units=FFN_UNITS, n=MULTI_NUM)
-# 这里注意 - 非序列特征在前 序列特征在后，不然后续的压缩对象就错了（包括序列特征里的拼接顺序，时间近的靠左）
+# 这里注意 - 非序列特征在前 序列特征在后，不然后续的压缩对象就错了（包括序列特征里的拼接顺序，时间近的在左）
 base_embedding = base_block(tf.concat([ns_feat, s_feat], axis=1))
 print("序列编码特征+非序列编码特征 → 过底层 OneBlock 结构后[batch_size, SEQ_LEN + N, D_MODEL]: ", base_embedding.shape)
 # 然后是不断蒸馏、压缩这段序列向量，理论上是有 seq_len 个序列，就压缩 seq_len 次
